@@ -1,7 +1,7 @@
 import cv2
 from flask import Flask, render_template, Response
 from ultralytics import YOLO
-from deep_sort_realtime.deepsort_tracker import DeepSort
+
 
 
 app = Flask(__name__)
@@ -13,7 +13,6 @@ model = YOLO("/Users/danishbokhari/testinggithub/Construction-Site-Safety-PPE-De
 # Open the video file using OpenCV
 cap = cv2.VideoCapture(0)
 
-tracker = DeepSort(max_age=30, n_init=3)
 
 
 # Function to generate video frames for the Flask web app
