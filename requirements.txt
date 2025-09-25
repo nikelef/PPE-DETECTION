@@ -3,4 +3,6 @@ ultralytics>=8.2.0
 opencv-python-headless>=4.8
 pillow>=9.5
 numpy>=1.24
-torch  # choose CPU or CUDA build manually if you care about GPU locally
+torch  # install the CUDA-appropriate build yourself if using GPU
+streamlit-webrtc>=0.47
+av>=11.0.0
