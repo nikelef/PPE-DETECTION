@@ -2,7 +2,7 @@
 # --------------------------------------------
 # Features
 # • Loads custom weights (models/best.pt) or a YOLOv8 preset.
-# • Image and video inference with confidence/IoU controls.
+# • Image, video-file, and LIVE webcam inference (WebRTC) with confidence/IoU controls.
 # • Per-class detection table and annotated outputs.
 # • GPU/CPU selector with graceful fallback.
 #
@@ -13,6 +13,7 @@ import io
 import time
 import tempfile
 from typing import List, Tuple
+import threading
 
 import numpy as np
 from PIL import Image
@@ -21,6 +22,10 @@ import streamlit as st
 
 # Ultralytics (YOLOv8)
 from ultralytics import YOLO
+
+# --- Webcam (WebRTC) ---
+import av
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
 
 # ---------- Page config ----------
 st.set_page_config(
@@ -52,7 +57,7 @@ def annotate_image(model: YOLO, image: Image.Image, conf: float, iou: float, dev
     """
     # Convert PIL -> numpy (RGB)
     img_np = np.array(image)
-    # YOLO expects BGR for plotting; prediction accepts RGB/BGR np arrays
+    # YOLO accepts numpy arrays; plotting returns BGR
     results = model.predict(
         source=img_np,
         conf=conf,
@@ -62,9 +67,7 @@ def annotate_image(model: YOLO, image: Image.Image, conf: float, iou: float, dev
         verbose=False
     )
     r = results[0]
-    # Annotated frame in BGR:
     annotated_bgr = r.plot()
-    # Convert to RGB for Streamlit display
     annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
 
     # Build a compact detections table
@@ -186,15 +189,18 @@ st.sidebar.caption("Tip: For PPE classes, prefer your trained weights at models/
 
 # ---------- Main UI ----------
 st.title("🦺 PPE Detection — YOLOv8 (Streamlit)")
-st.write("Upload an **image** or a **video** to run detection using your custom PPE model. "
-         "Results are annotated and summarized per class.")
+st.write(
+    "Upload an **image** or a **video** to run detection with your custom PPE model. "
+    "Or use the **Webcam (live)** tab for in-browser streaming (WebRTC)."
+)
 
 # Load model (cached)
 with st.spinner("Loading model…"):
     model = load_builtin(builtin_name) if use_builtin else load_model(weights_path)
 names = model.names
 
-tab_img, tab_vid = st.tabs(["Image(s)", "Video"])
+# ---------- Tabs ----------
+tab_img, tab_vid, tab_cam = st.tabs(["Image(s)", "Video", "Webcam (live)"])
 
 with tab_img:
     upl = st.file_uploader("Upload image(s)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True)
@@ -219,3 +225,84 @@ with tab_vid:
         st.video(out_path)
         st.download_button("Download annotated video", data=open(out_path, "rb").read(),
                            file_name="ppe_annotated.mp4", mime="video/mp4")
+
+# ---------- Webcam (WebRTC) ----------
+class YOLOWebcamProcessor(VideoProcessorBase):
+    """
+    WebRTC video processor that runs YOLOv8 on incoming frames and returns annotated frames.
+    Attributes are updated live from Streamlit controls via ctx.video_processor.
+    """
+    def __init__(self, model: YOLO):
+        self.model = model
+        self.conf = 0.25
+        self.iou = 0.5
+        self.imgsz = 640
+        self.device = "cpu"
+        self.frame_stride = 1
+        self.mirror = True
+        self._i = 0
+        self._lock = threading.Lock()
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        if self.mirror:
+            img = cv2.flip(img, 1)
+
+        out = img
+        # Throttle inference if desired
+        do_infer = (self._i % max(int(self.frame_stride), 1) == 0)
+        self._i += 1
+
+        if do_infer:
+            with self._lock:
+                results = self.model.predict(
+                    source=img,
+                    conf=self.conf,
+                    iou=self.iou,
+                    imgsz=self.imgsz,
+                    device=self.device if self.device else None,
+                    verbose=False
+                )
+            out = results[0].plot()  # BGR
+
+        return av.VideoFrame.from_ndarray(out, format="bgr24")
+
+with tab_cam:
+    st.markdown("**Live webcam inference (browser)** — works locally and on Streamlit Cloud.")
+    cam_cols = st.columns(3)
+    mirror = cam_cols[0].toggle("Mirror", value=True)
+    cam_stride = cam_cols[1].number_input("Frame stride", min_value=1, max_value=5, value=1, step=1, help="Process every Nth frame to improve FPS.")
+    cam_imgsz = cam_cols[2].select_slider("Image size", options=[320, 416, 512, 640, 768, 960], value=imgsz)
+
+    # WebRTC setup (use a public STUN server)
+    rtc_cfg = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+
+    # Factory to inject current model into the processor
+    def processor_factory():
+        return YOLOWebcamProcessor(model)
+
+    ctx = webrtc_streamer(
+        key="yolov8-ppe-webcam",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=rtc_cfg,
+        media_stream_constraints={"video": True, "audio": False},
+        video_processor_factory=processor_factory,
+        async_processing=True,
+    )
+
+    # Live-update processor parameters from sidebar controls
+    if ctx.video_processor:
+        vp: YOLOWebcamProcessor = ctx.video_processor
+        vp.conf = float(conf)
+        vp.iou = float(iou)
+        vp.imgsz = int(cam_imgsz)
+        vp.device = device_choice
+        vp.frame_stride = int(cam_stride)
+        vp.mirror = bool(mirror)
+
+    st.caption(
+        "Notes: WebRTC runs in-browser; GPU is used only if the server hosting this app has a CUDA device. "
+        "On Streamlit Cloud the session is CPU-only—consider increasing frame stride."
+    )
